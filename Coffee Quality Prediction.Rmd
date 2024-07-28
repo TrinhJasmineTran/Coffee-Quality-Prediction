@@ -1,0 +1,415 @@
+---
+title: "Challenge II: Prediction of Coffee Quality"
+author: "Jasmine Tran"
+date: "12/4/2023"
+output:
+  pdf_document: default
+  html_document: default
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning=FALSE, message=FALSE)
+library(dbplyr)
+library(tidyverse)
+library(tidymodels)
+tidymodels_prefer()
+library(glmnet)
+library(vip)
+```
+
+## I. Introduction
+
+The coffee plant is believed to be grown first on the Ethiopian plateau around 1500s. At that time, people was furious about how one became so awake and energetic after eating the berries from that plant. It was not until centuries later that coffee came to the Arabian Peninsula and then Europe. There, people started to see the rise of coffeehouses where most social activities and communication took place in major European cities. As time passed and the demand for coffee surges, there has been a strong and dynamic competition to grow coffee plants outside of the Peninsula. The plant entered the Americas in the 1700s with the flows of travelers, missionaries, traders, and colonists. And from that, it has become "the favorite drink of the civilized world", according to Thomas Jefferson.
+
+There are thousand of factors that can affect the quality of a coffee bean. It can be environmental elements such as soil quality, weather, sunshine, rainfall, etc. Bean quality can also be assessed on some characteristics of the bean itself such as aroma, flavor, aftertaste, etc. To predict the bean quality using those characteristics, the Coffee Quality Institute collected the data on coffee beans from different farms over the world and give each bean a grade on the scale 0-100 for its cupping (or tasting). Coffee cupping (or coffee tasting) is the practice of observing the tastes and aromas of brewed coffee. It involves deeply sniffing the coffee, then loudly slurping so that it spreads to the back of the tongue. Through the process, the taster attempts to measure the aroma, sweetness, acidity, and aftertaste. The origin of the bean can also be identified since the beans deeply embody the flavor from the region where they were grown. Grading coffee has been very necessary for both farmers and consumers to align the expectations with each other and establish a pair pricing system in the market. More than that, farmers have a chance to acknowledge the value of their coffee, the advantages and disadvantages they are facing to improve their job and livelihood.
+
+## II. Data Preparation
+
+The "Coffee ratings" dataset comes from a weekly data project called *TidyTuesday* from R4DS online learning community. It consists of 43 variables about 1339 coffee beans collected for grading purpose.
+
+```{r}
+#Import the dataset from the website
+coffee_ratings <- 
+  readr::read_csv('https://raw.githubusercontent.com/rfordatascience/tidytuesday/master/data/2020/2020-07-07/coffee_ratings.csv')
+```
+
+However, a great number of non-available entries are excluded and some data wrangling is done to make the dataset more approachable for modelling. The problem of multicollinearity is found between some numeric indicators of the bean quality, so we minimize the effect by eliminating highly-correlated variables. The final dataset looks like as follows:
+
+```{r include=FALSE}
+#Explore the correlation matrix to assess multicollinearity
+cor(coffee_ratings[c("aroma", "flavor", "acidity", "aftertaste", "body", "balance", "uniformity")])
+
+#Finalize the dataset (1339 observations x 13 variables)
+coffee_rating <- coffee_ratings %>%
+  mutate_if(is.character, as.factor) %>%
+  mutate(continent = ifelse(country_of_origin %in% c("Ethiopia","Guatemala","Uganda","Kenya","Tanzania","Burundi","Rwanda","Malawi","Zambia","Mauritius","Ivory Coast"), "Africa",
+                            ifelse(country_of_origin %in% c("USA","Hawaii","Puerto Rico"), "North America",
+                                   ifelse(country_of_origin %in% c("Costa Rica","Mexico","Brazil","Honduras","Colombia","Panama","El Salvador","Nicaragua","Ecuador","Haiti","Peru"), "South and Central America",
+                                          ifelse(country_of_origin %in% c("Indonesia","China","Taiwan","Thailand","Papua New Guinea","Japan","Vietnam","Philippines","Laos","Myanmar","India")
+, "Asia", "North America"))))) %>%
+  select(total_cup_points, species, aroma, acidity, uniformity, clean_cup, sweetness, aftertaste, moisture, number_of_bags, category_one_defects, category_two_defects, continent)
+```
+
+| Variable Name        | Variable Class | Description                              |
+|----------------------|----------------|------------------------------------------|
+| total_cup_points     | Double         | Total rating points (0-100)              |
+| species              | Character      | Species of the bean (Arabica or Robusta) |
+| aroma                | Double         | Aroma Grade                              |
+| acidity              | Double         | Acidity Grade                            |
+| uniformity           | Double         | Uniformity Grade                         |
+| clean_cup            | Double         | Clean Cup Grade                          |
+| sweetness            | Double         | Sweetness Grade                          |
+| aftertaste           | Double         | Aftertaste Grade                         |
+| moisture             | Double         | Moisture                                 |
+| number_of_bags       | Double         | Number of bags tested                    |
+| category_one_defects | Double         | Category one defects (count)             |
+| category_two_defects | Double         | Category two defects (count)             |
+| continent            | Character      | Bean origin by continent (4 levels)      |
+
+: Variable Description
+
+Then we continue by dividing the main dataset into training and testing datasets. The ratio is randomly at 70%, so that training data contains 70% of the original data (937 observations) and testing data contains 30% (402 observations).
+
+```{r}
+#Divide the dataset into training and testing datasets
+set.seed(12345)
+
+coffee_split <- initial_split(coffee_rating, prop= 0.7)
+coffee_train_tbl <- training(coffee_split)
+coffee_test_tbl <- testing(coffee_split)
+```
+
+## III. Explanatory Data Analysis
+
+Primary explanatory analysis is executed to examine the dataset. I use the original data for this process to fully understand the data. From the cup point distribution, it is interesting to notice that the points are mostly in the range of 75-90, with a few beans that have a grade of 62-63. The distribution shows that all the beans being graded are well-qualified beans, and here we are predicting what makes them being more well-qualified than others. Looking at the grid of 9 different scatter plots, we can see that `aroma`, `aftertaste`, and `acidity` have a very similar relationship with `total_cup_points` between the species of the beans. `Uniformity`, `moisture`, and all other variables can be vary for the beans that have the same total grade. Since the grade is mostly centered in the 75-80 range, the median grade by the bean by continental origin does not have much difference. However, South and Central America and Africa regions have more outliers compared to other regions.
+
+```{r echo=FALSE, fig.height=2}
+#Cup points distribution
+coffee_rating %>%
+  ggplot() +
+  geom_histogram(aes(x = total_cup_points)) +
+  labs(x = "Total Cup Points",
+       y = "Number Of Beans",
+       title = "Total Cup Points Distribution")
+```
+
+```{r echo=FALSE, fig.height=2}
+coffee_rating %>%
+  ggplot(aes(x = total_cup_points, y = continent, color = continent)) +
+  geom_boxplot(show.legend = FALSE) +
+  labs(x = "Total Cup Points",
+       y = "Origin",
+       title = " Coffee Bean Grade by Continent")
+```
+
+```{r echo=FALSE, fig.height=3}
+
+gg2 <- coffee_rating %>%
+  ggplot(aes(x = total_cup_points, y = aroma, color = species)) +
+  geom_point(show.legend = FALSE) +
+  theme(axis.title.x = element_blank(),
+        axis.text = element_text(size = 7),
+        axis.title = element_text(size = 9))
+
+gg3 <- coffee_rating %>%
+  ggplot(aes(x = total_cup_points, y = aftertaste, color = species)) +
+  geom_point(show.legend = FALSE) +
+  theme(axis.title.x = element_blank(),
+        axis.text = element_text(size = 7),
+        axis.title = element_text(size = 9))
+
+gg4 <- coffee_rating %>%
+  ggplot(aes(x = total_cup_points, y = uniformity, color = species)) +
+  geom_point(show.legend = FALSE) +
+  theme(axis.title.x = element_blank(),
+        axis.text = element_text(size = 7),
+        axis.title = element_text(size = 9))
+
+gg5 <- coffee_rating %>%
+  ggplot(aes(x = total_cup_points, y = sweetness, color = species)) +
+  geom_point(show.legend = FALSE) +
+  theme(axis.title.x = element_blank(),
+        axis.text = element_text(size = 7),
+        axis.title = element_text(size = 9))
+
+gg6 <- coffee_rating %>%
+  ggplot(aes(x = total_cup_points, y = moisture, color = species)) +
+  geom_point(show.legend = FALSE) +
+  theme(axis.title.x = element_blank(),
+        axis.text = element_text(size = 7),
+        axis.title = element_text(size = 9))
+
+gg7 <- coffee_rating %>%
+  ggplot(aes(x = total_cup_points, y = acidity, color = species)) +
+  geom_point(show.legend = FALSE) +
+  theme(axis.title.x = element_blank(),
+        axis.text = element_text(size = 7),
+        axis.title = element_text(size = 9))
+
+gg8 <- coffee_rating %>%
+  ggplot(aes(x = total_cup_points, y = category_one_defects, color = species)) +
+  geom_point(show.legend = FALSE) +
+  theme(axis.title.x = element_blank(),
+        axis.text = element_text(size = 7),
+        axis.title = element_text(size = 9))
+
+gg1 <- coffee_rating %>%
+  ggplot(aes(x = total_cup_points, y = number_of_bags, color = species)) +
+  geom_point(show.legend = FALSE) +
+  theme(axis.title.x = element_blank(),
+        axis.text = element_text(size = 7),
+        axis.title = element_text(size = 9))
+
+gg9 <- coffee_rating %>%
+  ggplot(aes(x = total_cup_points, y = category_two_defects, color = species)) +
+  geom_point() +
+  theme(axis.title.x = element_blank(),
+        axis.text = element_text(size = 7),
+        axis.title = element_text(size = 9),
+        legend.position = c(0.2,0.8),
+        legend.text = element_text(size = 7),
+        legend.title = element_text(size = 9))
+
+grid.arrange(gg2,gg3,gg4,gg5,gg6,gg7,gg8,gg9,gg1)
+```
+
+## IV. Modeling
+
+In this section, we apply 4 different regression methods: K-Nearest Neighbors method, Ridge Regression, Lasso Regression, and Random Forest Regression as main modelling techniques to explore the cupping points of the beans. Then, we use the fitted models on the testing data to find the model with the highest percentage of explanation (R-squared).
+
+### a. K-nearest Neighbors Technique
+
+I started with k-nearest neighbors model technique to predict the total coffee grade based on all other variables in the data.
+
+```{r}
+#Knn model specification
+knn_model <- nearest_neighbor(neighbors = tune()) %>%
+    set_engine("kknn") %>%
+    set_mode("regression")
+
+coffee_knn_recipe <- 
+  recipe(formula = total_cup_points ~ ., data = coffee_train_tbl)
+
+knn_wf <- workflow() %>%
+    add_recipe(coffee_knn_recipe) %>%
+    add_model(knn_model)
+
+#Prepare the tuned results using cross-validation
+coffee_knn_fold <- vfold_cv(coffee_train_tbl, v = 10)
+neighbors_grid_tbl <- grid_regular(neighbors(range = c(1, 800)), 
+                                   levels = 50)
+tune_results_1 <- tune_grid(object = knn_wf,
+                          resamples =coffee_knn_fold,
+                          grid = neighbors_grid_tbl)
+```
+
+Because we are working on 10-fold cross validation, the range for the grid was set from 1 to 800 and the levels to be 50. Our training data after the 10-fold cross validation will have around 840 observations and the testing will have more than 90 observations.
+
+```{r echo=FALSE, fig.height=2}
+autoplot(tune_results_1, metric = "rsq")
+```
+
+```{r results='hide'}
+#Find the optimal k value and finalize the model
+show_best(tune_results_1, metric = "rsq")
+best_neighbor <- select_by_one_std_err(tune_results_1, neighbors, metric = "rsq")
+knn_final_wf <- finalize_workflow(knn_wf, best_neighbor)
+knn_final_fit <- fit(knn_final_wf, coffee_train_tbl)
+```
+
+```{r echo=TRUE}
+#Evaluate the model on the testing data
+augment(knn_final_fit, coffee_test_tbl) %>%
+  rsq(total_cup_points, .pred)
+```
+
+Using the R-squared as the metric for the process, we got the optimal number of nearest neighbors of 17 and the R-squared value of 0.879. It suggests that 87.9% of the coffee bean grade is predicted by all other predictors in the data. The model looks at 17 nearby observations of the targeted observation and make corresponding prediction for that particular observation. K-nearest neighbors method relies on the metric of distance, so I believe that the more predictors there are (or the larger the data is), the less accurate the predictions are. This technique is usually used for problems with a limited number of predictors, because the model has narrower dimensional space to make predictions, which results in high accuracy. Therefore, in this situation, it's challenging to calculate the importance of each predictor. Although 87.9% is a good R-squared, let's explore other methods for more accurate predictions.
+
+### b. Tree-Based Modeling: Random Forest
+
+I applied tree-based Random Forest modeling technique with 10-fold cross validation for my analysis of coffee quality grading. I set the number of trees to be fixed at 100 trees and tuned the number of variables selected for each of my regression trees. There are 12 predictors in our dataset, so the range for parameter `mtry` is from 1 to 12.
+
+```{r}
+#Random Forest with tuned mtry
+set.seed(12345)
+forest_folds <- vfold_cv(coffee_train_tbl, v = 10)
+forest_grid <- grid_regular(mtry(range=c(1,12)), levels = 10)
+
+forest_recipe <- 
+  recipe(formula = total_cup_points ~ ., data = coffee_train_tbl) 
+
+forest_spec <- 
+  rand_forest(trees = 100, mtry=tune()) |> 
+  set_mode("regression") |> 
+  set_engine("ranger",importance = "impurity")  
+
+forest_workflow <- 
+  workflow() |> 
+  add_recipe(forest_recipe) |> 
+  add_model(forest_spec) 
+
+tune_results_2 <- tune_grid(forest_workflow, resamples = forest_folds, grid = forest_grid)
+```
+
+```{r echo=FALSE, fig.height=2}
+autoplot(tune_results_2, metric = "rsq")
+```
+
+```{r results='hide'}
+# Select best penalty
+best_penalty_2 <- select_best(tune_results_2, metric = "rsq")
+coffee_final_wf_2 <- finalize_workflow(forest_workflow,  best_penalty_2)
+
+coffee_final_fit_2 <- fit(coffee_final_wf_2, coffee_train_tbl)
+```
+
+```{r}
+augment(coffee_final_fit_2, coffee_test_tbl) |>
+  rsq(truth=total_cup_points, estimate=.pred)
+```
+
+```{r echo=FALSE, fig.height=2}
+extract_fit_parsnip(coffee_final_fit_2) %>%
+  vip()
+```
+
+The optimal value of variables is 7 and the R-squared for this model is 0.93. 93% of the bean grade is well-explained by the random forest tree model that consists of 100 trees. Looking at the variable importance chart, it makes sense that only 7 of 12 predictors should be selected for explaining the bean grade. While other predictors do contribute to the model, the cost they bring outweighs the benefit by increasing the model's complexity. Among most important variables, from most to least, are `aftertaste`, `acidity`, `uniformity`, `aroma, clean_cup`, and `sweetness`. Their levels of importance are approximately 4100, 2100, 1950, 1950, 1850, respectively. In this model, the characteristics of the bean itself play a more important role in predicting the bean quality than the factors of the grading process. However, it is interesting to see the number of bags being tested and the category II defects contribute to the explanation of the grade. The more bags get tested, the higher the chance of discovering low-quality beans. According to Sky Mountain Coffee brand, Specialty Grade coffee should have no category I defect and less than 5 category II defects. More than a half of the beans we are investigating has zero category I defect, so it is significant for the number of category II defects to determine the total cupping point of the beans.
+
+### c. Ridge Regression
+
+By using linear regression with the mixture of 0 and tuned penalty , we build the Ridge regression model with cross-validation to predict coffee bean grade. Here I use 10-fold cross validation to find the optimal penalty to generate the highest R-squared possible for the model.
+
+```{r fig.height=3}
+#Ridge with tuned penalty
+coffee_model_3 <- 
+  linear_reg(mixture = 0, penalty= tune()) %>% 
+  set_mode("regression") %>% 
+  set_engine("glmnet")
+
+coffee_recipe <- 
+  recipe(formula = total_cup_points ~ ., data = coffee_train_tbl) %>% 
+  step_dummy(all_nominal_predictors()) %>% 
+  step_normalize(all_predictors())
+
+coffee_wf_3 <- workflow() %>% 
+  add_recipe(coffee_recipe) %>% 
+  add_model(coffee_model_3)
+
+#Find the optimal penalty value using cross-validation
+coffee_fold <- vfold_cv(coffee_train_tbl, v = 10)
+
+penalty_grid <-
+  grid_regular(penalty(range = c(-3, 3)), levels = 20)
+
+coffee_tune_result_3 <- tune_grid(coffee_wf_3,
+  resamples = coffee_fold, 
+  grid = penalty_grid)
+```
+
+```{r echo=FALSE, fig.height=2}
+autoplot(coffee_tune_result_3, metric = "rsq")
+```
+
+```{r results='hide'}
+best_penalty_3 <- select_best(coffee_tune_result_3, metric = "rsq")
+coffee_final_wf_3 <- finalize_workflow(coffee_wf_3, best_penalty_3)
+coffee_final_fit_3 <- fit(coffee_final_wf_3, data = coffee_train_tbl)
+```
+
+```{r}
+augment(coffee_final_fit_3, coffee_test_tbl) %>%
+  rsq(truth = total_cup_points, estimate = .pred)
+```
+
+```{r echo=FALSE, fig.height=5}
+graph_2 <- extract_fit_parsnip(coffee_final_fit_3) %>%
+  vip() +
+  labs(title = "Ridge Variable Importance") +
+  theme(axis.title.x = element_blank())
+```
+
+The optimal penalty is at 0.001 and the corresponding R-squared is 0.954. It looks like aftertaste has the greatest impact on the coffee bean overall grade, with the estimated coefficient of 1.08. The good thing is that the R-squared has increased by nearly 7% from the previous knn model. Other than `aftertaste`, the next powerful predictors namely `clean_cup`, `aroma`, `acidity`, `sweetness`, and `uniformity` with corresponding coefficients to be 0.824, 0.795, 0.774, 0.673, 0.604, respectively. This model witnesses some other new important predictors: `moisture`, `category_one_defects`, `species_Robusta`. It can be denied that the number of category I defects should be a significant predictor since it is the requirement to be grade as Specialty Grade Coffee.
+
+### c. Lasso Regression
+
+We then tried the Lasso regression model with 10-fold validation to make some comparison with the Ridge model. I used to same code as above with mixture of 1. The penalty is tuned in this model to find the optimal value for the highest R-squared.
+
+```{r fig.height=3}
+#LASSO with tuned penalty
+coffee_model_4 <- 
+  linear_reg(mixture = 1, penalty=tune()) %>% 
+  set_mode("regression") %>% 
+  set_engine("glmnet")
+
+coffee_recipe <- 
+  recipe(formula = total_cup_points ~ ., data = coffee_train_tbl) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_normalize(all_predictors())
+
+coffee_wf_4 <- workflow() %>% 
+  add_recipe(coffee_recipe) %>% 
+  add_model(coffee_model_4)
+
+#Find the optimal penalty value using cross-validation
+coffee_fold <- vfold_cv(coffee_train_tbl, v = 10)
+
+penalty_grid <-
+  grid_regular(penalty(range = c(-3, 3)), levels = 20)
+
+coffee_tune_result_4 <- tune_grid(coffee_wf_4,
+  resamples = coffee_fold, 
+  grid = penalty_grid)
+```
+
+```{r echo=FALSE, fig.height=2}
+autoplot(coffee_tune_result_4, metric = "rsq")
+```
+
+```{r}
+best_penalty_4 <- select_best(coffee_tune_result_4, metric = "rsq")
+coffee_final_wf_4 <- finalize_workflow(coffee_wf_4, best_penalty_4)
+coffee_final_fit_4 <- fit(coffee_final_wf_4, data = coffee_train_tbl)
+```
+
+```{r}
+augment(coffee_final_fit_4, coffee_test_tbl) %>%
+  rsq(truth = total_cup_points, estimate = .pred)
+```
+
+```{r include=FALSE}
+graph_1 <- extract_fit_parsnip(coffee_final_fit_4) %>%
+  vip() +
+  labs(title = "Lasso Variable Importance") +
+  theme(axis.title.x = element_blank())
+```
+
+```{r echo=FALSE, fig.height=4}
+grid.arrange(graph_1, graph_2)
+```
+
+R-squared value for the Lasso model is 0.956 with the penalty of 0.0183. The R-squared is not significantly different from the previous Ridge model and the most important variables stays approximately the same. The upper variable importance chart is of the Lasso model and the lower is of the Ridge model. We can see that they share a significant number of similarities. The order of importance does not change; only the levels of importance change. Therefore, the Lasso model can be seen as a revised version of the Ridge model with higher R-squared.
+
+## Conclusion
+
+| Models              | R-squared | Important Variables             |
+|---------------------|-----------|---------------------------------|
+| K-nearest neighbors | 87.9%     | N/A                             |
+| Random Forest       | 93.0%     | aftertaste, acidity, uniformity |
+| Ridge               | 95.4%     | aftertaste, clean_cup, aroma    |
+| Lasso               | 95.6%     | aftertaste, clean_cup, aroma    |
+
+: Model Comparison
+
+In the application of k-nearest neighbors model, random forest, Ridge regression, and Lasso regression to predict the coffee bean quality, the Lasso regression achieves the highest R-squared value. All models agree that the aftertaste of the bean determines its cupping grade. Clean-cup points (or the absence of unusual taste) is the 3rd significant in Ridge and Lasso regression, while it is at the 6th in tree-based model. Reversely, the 3rd significant variable `uniformity` in the random forest model ranks the 6th in both Ridge and Lasso. In conclusion, since the coffee has several numeric predictors with a few categorical predictors, either Ridge or Lasso regression, which represent advanced linear regression, works best to achieve high R-squared and eliminate the problem of multicollinearity.
+
+#### Data
+
+<https://github.com/rfordatascience/tidytuesday/blob/master/data/2020/2020-07-07/readme.md>
+
+#### Articles
+
+-   <https://database.coffeeinstitute.org/coffee/357789/grade>
+
+-   <https://skymountaincoffee.com/what-is-specialty-grade-coffee/>
